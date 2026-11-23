@@ -1,9 +1,79 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
-import { StellarNetwork } from '@prisma/client';
+import { Prisma, StellarNetwork } from '@prisma/client';
 import type { PrismaService } from '../../database/prisma.service';
 import { PaymentsRepository } from './payments.repository';
 
 describe('PaymentsRepository', () => {
+  const paymentInput = {
+    paymentRequestId: 'request-1',
+    senderUserId: 'sender-1',
+    receiverUserId: 'receiver-1',
+    recipient: 'GRECIPIENT',
+    senderPublicKey: 'GSENDER',
+    asset: 'XLM' as const,
+    amount: '1.25',
+    network: StellarNetwork.TESTNET,
+    expiresAt: new Date('2026-12-01T00:00:00.000Z'),
+  };
+
+  it('maps a payment-request unique race to PAYMENT_REQUEST_CONSUMED', async () => {
+    const error = new Prisma.PrismaClientKnownRequestError('duplicate', {
+      code: 'P2002',
+      clientVersion: 'test',
+      meta: { target: ['paymentRequestId'] },
+    });
+    const prisma = {
+      $transaction: jest.fn((callback: (value: unknown) => unknown) =>
+        callback({
+          payment: { create: jest.fn().mockRejectedValue(error) },
+          paymentRequest: { update: jest.fn() },
+        }),
+      ),
+    };
+
+    await expect(
+      new PaymentsRepository(prisma as unknown as PrismaService).create(
+        paymentInput,
+      ),
+    ).rejects.toMatchObject({ response: { code: 'PAYMENT_REQUEST_CONSUMED' } });
+  });
+
+  it('maps a transaction-history unique race to TRANSACTION_ALREADY_INDEXED', async () => {
+    const error = new Prisma.PrismaClientKnownRequestError('duplicate', {
+      code: 'P2002',
+      clientVersion: 'test',
+      meta: { target: ['userId', 'stellarTxHash'] },
+    });
+    const tx = {
+      payment: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      transaction: { upsert: jest.fn().mockRejectedValue(error) },
+    };
+    const prisma = {
+      $transaction: jest.fn((callback: (value: typeof tx) => unknown) =>
+        callback(tx),
+      ),
+    };
+
+    await expect(
+      new PaymentsRepository(
+        prisma as unknown as PrismaService,
+      ).markConfirmedAndRecord({
+        paymentId: 'payment-1',
+        senderUserId: 'sender-1',
+        receiverUserId: 'receiver-1',
+        senderPublicKey: 'GSENDER',
+        recipient: 'GRECIPIENT',
+        asset: 'XLM',
+        amount: '1.25',
+        network: StellarNetwork.TESTNET,
+        stellarTxHash: 'a'.repeat(64),
+        ledger: 123,
+      }),
+    ).rejects.toMatchObject({
+      response: { code: 'TRANSACTION_ALREADY_INDEXED' },
+    });
+  });
+
   it('confirms a payment and indexes sender/receiver history in one transaction', async () => {
     const tx = {
       payment: {

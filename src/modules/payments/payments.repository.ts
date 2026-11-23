@@ -6,6 +6,56 @@ import {
 import { PaymentStatus, Prisma, StellarNetwork } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 
+function mapUniqueViolation(
+  error: Prisma.PrismaClientKnownRequestError,
+): ConflictException {
+  const target = error.meta?.target;
+  const fields = Array.isArray(target)
+    ? target.map(String)
+    : target
+      ? [String(target)]
+      : [];
+
+  if (fields.includes('paymentRequestId')) {
+    return new ConflictException({
+      statusCode: 409,
+      message: 'Payment request has already been used.',
+      code: 'PAYMENT_REQUEST_CONSUMED',
+    });
+  }
+
+  if (fields.includes('paymentId')) {
+    return new ConflictException({
+      statusCode: 409,
+      message: 'Payment history has already been indexed.',
+      code: 'PAYMENT_HISTORY_ALREADY_INDEXED',
+    });
+  }
+
+  if (fields.includes('stellarTxHash')) {
+    return new ConflictException({
+      statusCode: 409,
+      message: 'This Stellar transaction is already indexed for the user.',
+      code: 'TRANSACTION_ALREADY_INDEXED',
+    });
+  }
+
+  return new ConflictException({
+    statusCode: 409,
+    message: 'A unique payment value already exists.',
+    code: 'PAYMENT_UNIQUE_CONSTRAINT',
+  });
+}
+
+function isUniqueViolation(
+  error: unknown,
+): error is Prisma.PrismaClientKnownRequestError {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === 'P2002'
+  );
+}
+
 @Injectable()
 export class PaymentsRepository {
   constructor(private readonly prisma: PrismaService) {}
@@ -71,16 +121,7 @@ export class PaymentsRepository {
         });
         return payment;
       } catch (error) {
-        if (
-          error instanceof Prisma.PrismaClientKnownRequestError &&
-          error.code === 'P2002'
-        ) {
-          throw new ConflictException({
-            statusCode: 409,
-            message: 'Payment request has already been used.',
-            code: 'PAYMENT_REQUEST_CONSUMED',
-          });
-        }
+        if (isUniqueViolation(error)) throw mapUniqueViolation(error);
         throw error;
       }
     });
@@ -110,67 +151,72 @@ export class PaymentsRepository {
     stellarTxHash: string;
     ledger: number;
   }) {
-    return this.prisma.$transaction(async (tx) => {
-      const marked = await tx.payment.updateMany({
-        where: { id: input.paymentId, status: 'SUBMITTED' },
-        data: {
-          status: 'CONFIRMED',
-          stellarTxHash: input.stellarTxHash,
-          confirmedAt: new Date(),
-        },
-      });
-      if (marked.count !== 1) {
-        throw new ConflictException({
-          statusCode: 409,
-          message: 'Payment is no longer in a SUBMITTED state.',
-          code: 'PAYMENT_INVALID_STATE',
+    return this.prisma
+      .$transaction(async (tx) => {
+        const marked = await tx.payment.updateMany({
+          where: { id: input.paymentId, status: 'SUBMITTED' },
+          data: {
+            status: 'CONFIRMED',
+            stellarTxHash: input.stellarTxHash,
+            confirmedAt: new Date(),
+          },
         });
-      }
+        if (marked.count !== 1) {
+          throw new ConflictException({
+            statusCode: 409,
+            message: 'Payment is no longer in a SUBMITTED state.',
+            code: 'PAYMENT_INVALID_STATE',
+          });
+        }
 
-      const common = {
-        stellarTxHash: input.stellarTxHash,
-        asset: input.asset,
-        amount: input.amount,
-        memo: input.memo ?? null,
-        network: input.network,
-        ledger: input.ledger,
-      };
+        const common = {
+          stellarTxHash: input.stellarTxHash,
+          asset: input.asset,
+          amount: input.amount,
+          memo: input.memo ?? null,
+          network: input.network,
+          ledger: input.ledger,
+        };
 
-      const sent = await tx.transaction.upsert({
-        where: {
-          userId_stellarTxHash: {
+        const sent = await tx.transaction.upsert({
+          where: {
+            userId_stellarTxHash: {
+              userId: input.senderUserId,
+              stellarTxHash: input.stellarTxHash,
+            },
+          },
+          update: { paymentId: input.paymentId, ...common },
+          create: {
             userId: input.senderUserId,
-            stellarTxHash: input.stellarTxHash,
+            paymentId: input.paymentId,
+            direction: 'SENT',
+            counterparty: input.recipient,
+            ...common,
           },
-        },
-        update: { paymentId: input.paymentId, ...common },
-        create: {
-          userId: input.senderUserId,
-          paymentId: input.paymentId,
-          direction: 'SENT',
-          counterparty: input.recipient,
-          ...common,
-        },
-      });
+        });
 
-      const received = await tx.transaction.upsert({
-        where: {
-          userId_stellarTxHash: {
+        const received = await tx.transaction.upsert({
+          where: {
+            userId_stellarTxHash: {
+              userId: input.receiverUserId,
+              stellarTxHash: input.stellarTxHash,
+            },
+          },
+          update: common,
+          create: {
             userId: input.receiverUserId,
-            stellarTxHash: input.stellarTxHash,
+            direction: 'RECEIVED',
+            counterparty: input.senderPublicKey,
+            ...common,
           },
-        },
-        update: common,
-        create: {
-          userId: input.receiverUserId,
-          direction: 'RECEIVED',
-          counterparty: input.senderPublicKey,
-          ...common,
-        },
-      });
+        });
 
-      return { sent, received };
-    });
+        return { sent, received };
+      })
+      .catch((error: unknown) => {
+        if (isUniqueViolation(error)) throw mapUniqueViolation(error);
+        throw error;
+      });
   }
 
   markFailed(id: string, code: string, reason: string) {
